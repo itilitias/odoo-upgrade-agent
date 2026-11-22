@@ -7,36 +7,52 @@ bare kan gjøre det skriptet tillater:
     command="/usr/local/bin/odoo-upgrade-receive",restrict,from="203.0.113.10" ssh-ed25519 AAAA… odoo-upgrade-panel
 
 Kommandoer (sendes av panelet):
-    hello                               versjon og konfigurasjon
-    check <db>                          finnes databasen, ledig plass
-    restore <db> [--overwrite] [--neutralize]
-                                        les backup.zip fra stdin og gjenopprett
+    hello                                         versjon og hvilke instanser som kan ta imot
+    check <db> [--instance NAVN]                  finnes databasen, ledig plass
+    restore <db|-> [--instance NAVN] [--overwrite] [--neutralize]
+                                                  les backup.zip fra stdin og gjenopprett
 
-Innstillinger i /etc/odoo-upgrade-receive.conf (valgfri):
+To måter å sette det opp på, i /etc/odoo-upgrade-receive.conf:
+
+1) Én Odoo på serveren, skriptet kjører som Odoo-brukeren (enkel installasjon):
 
     [receive]
-    odoo_conf = /etc/odoo/odoo.conf     # leser db_host, db_port, db_user, db_password, data_dir
-    data_dir =                          # overstyr Odoos data_dir (filestore ligger i <data_dir>/filestore/<db>)
-    allow_overwrite = false             # må være true for at panelet kan erstatte en database
-    db_pattern = ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$
-    after_restore =                     # kommando som kjøres etterpå, f.eks. sudo systemctl restart odoo
+    odoo_conf = /etc/odoo/odoo.conf
+    allow_overwrite = false
+    after_restore =
 
-Skriptet bruker psql/createdb/dropdb fra serveren og trenger ingen andre pakker.
+2) Flere instanser på samme server (f.eks. CloudPepper), skriptet kjører som root.
+   Bare instansene som står her, kan ta imot. Produksjon lar du være ute.
+
+    [instance:newstaging]
+    odoo_conf = /var/odoo/newstaging-itiliti.cloudpepper.site/odoo.conf
+    run_as = odoo
+    service = odona-newstaging-itiliti.cloudpepper.site.service
+    allow_overwrite = true
+    keep_previous = true
+
+   Databasen hentes fra db_name i odoo_conf. Den nye databasen gjenopprettes ved siden av den
+   gamle; først når den er klar, stoppes tjenesten, databasene bytter navn, filestore byttes,
+   og tjenesten startes igjen. Med keep_previous = true blir den gamle liggende som
+   <db>__forrige_<tidspunkt>, så du kan gå tilbake.
 """
 
 import configparser
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
-VERSION = "1.0"
+VERSION = "1.1"
 CONF = os.environ.get("ODOO_UPGRADE_RECEIVE_CONF", "/etc/odoo-upgrade-receive.conf")
+DB_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"
 
 NEUTRALIZE = [
     "UPDATE ir_cron SET active = false",
@@ -56,76 +72,168 @@ def fail(msg, code=1):
     sys.exit(code)
 
 
-def load_settings():
+def truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "ja")
+
+
+def read_conf():
     cfg = configparser.ConfigParser()
     cfg.read(CONF)
-    r = cfg["receive"] if cfg.has_section("receive") else {}
+    return cfg
+
+
+def instances(cfg):
+    return {s.split(":", 1)[1]: cfg[s] for s in cfg.sections() if s.startswith("instance:")}
+
+
+def settings(cfg, instance=None):
+    if instance:
+        inst = instances(cfg)
+        if instance not in inst:
+            fail(f"instansen «{instance}» er ikke satt opp for å ta imot (se {CONF})")
+        r = inst[instance]
+    else:
+        if instances(cfg) and not cfg.has_section("receive"):
+            fail("serveren har flere instanser; panelet må oppgi hvilken (ssh://bruker@server/INSTANS)")
+        r = cfg["receive"] if cfg.has_section("receive") else {}
     odoo = configparser.ConfigParser()
     odoo_conf = r.get("odoo_conf", "/etc/odoo/odoo.conf")
     odoo.read(odoo_conf)
     o = odoo["options"] if odoo.has_section("options") else {}
 
-    def pick(key, odoo_key=None, default=""):
-        value = r.get(key) or o.get(odoo_key or key) or default
+    def pick(key, default=""):
+        value = r.get(key) or o.get(key) or default
         return "" if value in ("False", "false", None) else str(value)
 
-    data_dir = pick("data_dir", default=os.path.expanduser("~/.local/share/Odoo"))
-    env = os.environ.copy()
+    run_as = r.get("run_as", "")
+    home = pwd.getpwnam(run_as).pw_dir if run_as else os.path.expanduser("~")
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "HOME")}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     for env_key, key in (("PGHOST", "db_host"), ("PGPORT", "db_port"), ("PGUSER", "db_user"), ("PGPASSWORD", "db_password")):
         value = pick(key)
         if value:
             env[env_key] = value
     return {
+        "instance": instance,
         "env": env,
-        "data_dir": data_dir,
+        "run_as": run_as,
+        "pg_admin": r.get("pg_admin", "postgres" if run_as else ""),
+        "pg_admin_host": r.get("pg_admin_host", ""),
+        "data_dir": pick("data_dir", os.path.join(home, ".local", "share", "Odoo")),
         "odoo_conf": odoo_conf,
-        "allow_overwrite": str(r.get("allow_overwrite", "false")).lower() in ("1", "true", "yes"),
-        "db_pattern": r.get("db_pattern", r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"),
+        "fixed_db": pick("db_name") if instance else "",
+        "service": r.get("service", ""),
+        "allow_overwrite": truthy(r.get("allow_overwrite", "false")),
+        "keep_previous": truthy(r.get("keep_previous", "true")),
         "after_restore": r.get("after_restore", ""),
     }
 
 
-def psql(s, sql, db="postgres", check=True):
-    p = subprocess.run(["psql", "-X", "-q", "-At", "-d", db, "-c", sql], env=s["env"], capture_output=True, text=True)
+def run(s, cmd, as_admin=False, check=True):
+    """Kjør en kommando som Odoo-brukeren, eller som postgres-brukeren for operasjoner på databaser."""
+    user = s["pg_admin"] if as_admin else s["run_as"]
+    env = dict(s["env"])
+    if as_admin and s["pg_admin"]:
+        for k in ("PGUSER", "PGPASSWORD", "PGHOST"):
+            env.pop(k, None)
+        if s["pg_admin_host"]:
+            env["PGHOST"] = s["pg_admin_host"]
+    full = cmd
+    if user and os.geteuid() == 0:
+        full = ["runuser", "-u", user, "--", "env", *[f"{k}={v}" for k, v in env.items()], *cmd]
+    p = subprocess.run(full, env=env, capture_output=True, text=True)
     if check and p.returncode != 0:
-        fail(f"psql: {p.stderr.strip()[:300]}")
-    return p.stdout.strip()
+        fail(f"{cmd[0]}: {p.stderr.strip()[:300]}")
+    return p
+
+
+def psql(s, sql, db="postgres", as_admin=False, check=True):
+    return run(s, ["psql", "-X", "-q", "-At", "-d", db, "-c", sql], as_admin=as_admin, check=check).stdout.strip()
 
 
 def db_exists(s, name):
-    return psql(s, f"SELECT 1 FROM pg_database WHERE datname = '{name}'") == "1"
+    return psql(s, f"SELECT 1 FROM pg_database WHERE datname = '{name}'", as_admin=bool(s["pg_admin"])) == "1"
 
 
-def cmd_hello(s, args):
-    print(json.dumps({"receiver": VERSION, "odoo_conf": s["odoo_conf"], "data_dir": s["data_dir"],
-                      "allow_overwrite": s["allow_overwrite"]}), flush=True)
-
-
-def cmd_check(s, args):
-    name = args[0] if args else ""
-    if not re.fullmatch(s["db_pattern"], name):
+def target_db(s, name):
+    if s["fixed_db"]:
+        if name not in ("-", "", s["fixed_db"]):
+            fail(f"instansen bruker databasen «{s['fixed_db']}», ikke «{name}»")
+        return s["fixed_db"]
+    if not re.fullmatch(DB_RE, name or ""):
         fail("ugyldig databasenavn")
-    os.makedirs(s["data_dir"], exist_ok=True)
-    free = shutil.disk_usage(s["data_dir"]).free
-    print(json.dumps({"exists": db_exists(s, name), "free_gb": round(free / 1e9, 1),
-                      "allow_overwrite": s["allow_overwrite"]}), flush=True)
+    return name
 
 
-def cmd_restore(s, args):
-    if not args:
-        fail("mangler databasenavn")
-    name, flags = args[0], set(args[1:])
-    if not re.fullmatch(s["db_pattern"], name):
-        fail("ugyldig databasenavn")
+def parse_args(args):
+    name = args[0] if args and not args[0].startswith("--") else "-"
+    rest = args[1:] if args and not args[0].startswith("--") else args
+    flags, instance, i = set(), None, 0
+    while i < len(rest):
+        if rest[i] == "--instance" and i + 1 < len(rest):
+            instance = rest[i + 1]
+            i += 2
+            continue
+        flags.add(rest[i])
+        i += 1
+    if instance and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", instance):
+        fail("ugyldig instansnavn")
+    return name, instance, flags
+
+
+def cmd_hello(cfg, args):
+    inst = {k: {"db": settings(cfg, k)["fixed_db"], "allow_overwrite": truthy(v.get("allow_overwrite", "false"))}
+            for k, v in instances(cfg).items()}
+    out = {"receiver": VERSION, "instances": inst}
+    if cfg.has_section("receive") or not inst:
+        s = settings(cfg)
+        out.update(odoo_conf=s["odoo_conf"], data_dir=s["data_dir"], allow_overwrite=s["allow_overwrite"])
+    print(json.dumps(out), flush=True)
+
+
+def cmd_check(cfg, args):
+    name, instance, _ = parse_args(args)
+    s = settings(cfg, instance)
+    name = target_db(s, name)
+    base = s["data_dir"] if os.path.isdir(s["data_dir"]) else "/"
+    print(json.dumps({"db": name, "exists": db_exists(s, name), "free_gb": round(shutil.disk_usage(base).free / 1e9, 1),
+                      "allow_overwrite": s["allow_overwrite"], "instance": instance}), flush=True)
+
+
+def _chown(s, path):
+    if s["run_as"] and os.geteuid() == 0 and os.path.exists(path):
+        pw = pwd.getpwnam(s["run_as"])
+        os.lchown(path, pw.pw_uid, pw.pw_gid)
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                os.lchown(os.path.join(root, n), pw.pw_uid, pw.pw_gid)
+
+
+def _service(s, action):
+    if s["service"]:
+        say(f"{'stopper' if action == 'stop' else 'starter'} {s['service']}")
+        p = subprocess.run(["systemctl", action, s["service"]], capture_output=True, text=True)
+        if p.returncode != 0 and action == "start":
+            fail(f"klarte ikke å starte {s['service']}: {p.stderr.strip()[:200]}")
+
+
+def cmd_restore(cfg, args):
+    name, instance, flags = parse_args(args)
+    s = settings(cfg, instance)
+    name = target_db(s, name)
     overwrite, neutralize = "--overwrite" in flags, "--neutralize" in flags
-    if db_exists(s, name):
-        if not overwrite:
-            fail(f"databasen «{name}» finnes allerede")
-        if not s["allow_overwrite"]:
-            fail("serveren tillater ikke å erstatte databaser (allow_overwrite = false i /etc/odoo-upgrade-receive.conf)")
+    exists = db_exists(s, name)
+    if exists and not overwrite:
+        fail(f"databasen «{name}» finnes allerede")
+    if exists and not s["allow_overwrite"]:
+        fail(f"serveren tillater ikke å erstatte databaser (allow_overwrite = false i {CONF})")
 
-    os.makedirs(s["data_dir"], exist_ok=True)
-    work = tempfile.mkdtemp(prefix=".upgrade-receive-", dir=s["data_dir"])
+    admin = bool(s["pg_admin"])
+    work_root = "/var/tmp" if s["run_as"] else s["data_dir"]
+    os.makedirs(work_root, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="upgrade-receive-", dir=work_root)
+    new = f"{name}__ny"[:63]
+    stamp = time.strftime("%Y%m%d_%H%M")
     try:
         say("tar imot backup")
         path = os.path.join(work, "backup.zip")
@@ -140,44 +248,65 @@ def cmd_restore(s, args):
                 if n.startswith("/") or ".." in n.split("/"):
                     fail(f"ugyldig sti i backupen: {n}")
             zf.extract("dump.sql", work)
-            fs_members = [n for n in names if n.startswith("filestore/") and not n.endswith("/")]
             fs_tmp = os.path.join(work, "fs")
-            for n in fs_members:
-                zf.extract(n, fs_tmp)
+            for n in names:
+                if n.startswith("filestore/") and not n.endswith("/"):
+                    zf.extract(n, fs_tmp)
         os.remove(path)
+        _chown(s, work)
 
-        if db_exists(s, name):
-            say(f"sletter gamle «{name}»")
-            psql(s, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}' AND pid <> pg_backend_pid()")
-            r = subprocess.run(["dropdb", name], env=s["env"], capture_output=True, text=True)
-            if r.returncode != 0:
-                fail(f"dropdb: {r.stderr.strip()[:300]}")
+        # 1. Gjenopprett ved siden av den gamle, så den gamle er urørt til alt er klart
+        if db_exists(s, new):
+            psql(s, f'DROP DATABASE "{new}"', as_admin=admin)
         say("lager database")
-        r = subprocess.run(["createdb", "-T", "template0", "-E", "UTF8", name], env=s["env"], capture_output=True, text=True)
-        if r.returncode != 0:
-            fail(f"createdb: {r.stderr.strip()[:300]}")
-        say("gjenoppretter database")
-        r = subprocess.run(["psql", "-X", "-q", "-o", "/dev/null", "-d", name, "-f", os.path.join(work, "dump.sql")],
-                           env=s["env"], capture_output=True, text=True)
-        tables = psql(s, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'ir_module_module'", db=name)
-        if tables != "1":
-            fail(f"gjenopprettingen feilet: {r.stderr.strip()[-300:]}")
-
-        say("kopierer filestore")
-        target = os.path.join(s["data_dir"], "filestore", name)
-        if os.path.exists(target):
-            shutil.rmtree(target)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        src = os.path.join(work, "fs", "filestore")
-        if os.path.isdir(src):
-            shutil.move(src, target)
+        owner = s["env"].get("PGUSER") or s["run_as"]
+        if admin:
+            run(s, ["createdb", "-T", "template0", "-E", "UTF8", "-O", owner, new], as_admin=True)
         else:
-            os.makedirs(target)
-
+            run(s, ["createdb", "-T", "template0", "-E", "UTF8", new])
+        say("gjenoppretter database")
+        r = run(s, ["psql", "-X", "-q", "-o", "/dev/null", "-d", new, "-f", os.path.join(work, "dump.sql")], check=False)
+        if psql(s, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'ir_module_module'", db=new) != "1":
+            psql(s, f'DROP DATABASE IF EXISTS "{new}"', as_admin=admin, check=False)
+            fail(f"gjenopprettingen feilet: {r.stderr.strip()[-300:]}")
         if neutralize:
             say("slår av e-post og planlagte handlinger (testkopi)")
             for stmt in NEUTRALIZE:
-                psql(s, stmt, db=name, check=False)
+                psql(s, stmt, db=new, check=False)
+
+        # 2. Bytt: stopp tjenesten, gi databasene nye navn, bytt filestore, start igjen
+        _service(s, "stop")
+        try:
+            target = os.path.join(s["data_dir"], "filestore", name)
+            if exists:
+                psql(s, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}' AND pid <> pg_backend_pid()",
+                     as_admin=admin, check=False)
+                if s["keep_previous"]:
+                    prev = f"{name}__forrige_{stamp}"[:63]
+                    say(f"tar vare på den gamle som «{prev}»")
+                    psql(s, f'ALTER DATABASE "{name}" RENAME TO "{prev}"', as_admin=admin)
+                    if os.path.isdir(target):
+                        shutil.move(target, os.path.join(s["data_dir"], "filestore", prev))
+                else:
+                    say(f"sletter gamle «{name}»")
+                    psql(s, f'DROP DATABASE "{name}"', as_admin=admin)
+                    shutil.rmtree(target, ignore_errors=True)
+            psql(s, f'ALTER DATABASE "{new}" RENAME TO "{name}"', as_admin=admin)
+            say("legger på plass filestore")
+            if os.path.exists(target):
+                shutil.rmtree(target)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            src = os.path.join(work, "fs", "filestore")
+            if os.path.isdir(src):
+                shutil.move(src, target)
+            else:
+                os.makedirs(target)
+            _chown(s, target)
+            if s["run_as"] and os.geteuid() == 0:
+                pw = pwd.getpwnam(s["run_as"])
+                os.lchown(os.path.dirname(target), pw.pw_uid, pw.pw_gid)
+        finally:
+            _service(s, "start")
 
         if s["after_restore"]:
             say("kjører after_restore")
@@ -195,7 +324,7 @@ def main():
     commands = {"hello": cmd_hello, "check": cmd_check, "restore": cmd_restore}
     if parts[0] not in commands:
         fail(f"ukjent kommando: {parts[0]}")
-    commands[parts[0]](load_settings(), parts[1:])
+    commands[parts[0]](read_conf(), parts[1:])
 
 
 if __name__ == "__main__":
