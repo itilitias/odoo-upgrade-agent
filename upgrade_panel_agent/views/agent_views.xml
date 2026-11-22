@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="upgrade_agent_wizard_form" model="ir.ui.view">
+        <field name="name">upgrade.agent.wizard.form</field>
+        <field name="model">upgrade.agent.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Upgrade panel agent">
+                <sheet>
+                    <div class="oe_title">
+                        <h1>Upgrade panel agent</h1>
+                        <p>Lets the upgrade panel fetch a backup of this database without enabling the database manager (list_db) or sharing the master password. Access is off until you open it.</p>
+                    </div>
+                    <field name="status_html" nolabel="1"/>
+                    <group string="1. Key">
+                        <field name="new_token"/>
+                        <div colspan="2" class="text-muted">The key is shown only once, right after you create it. Paste it into the upgrade panel. Creating a new key replaces the old one.</div>
+                    </group>
+                    <div>
+                        <button name="action_new_key" type="object" string="Create new key" class="btn-secondary"/>
+                        <button name="action_revoke_key" type="object" string="Revoke key" class="btn-link" confirm="Revoke the key? The panel can no longer connect."/>
+                    </div>
+                    <group string="2. Open access">
+                        <field name="hours"/>
+                        <field name="allowed_ips" placeholder="e.g. 203.0.113.10"/>
+                    </group>
+                    <div>
+                        <button name="action_open" type="object" string="Open access" class="btn-primary"/>
+                        <button name="action_close" type="object" string="Close now" class="btn-secondary"/>
+                    </div>
+                    <separator string="Log"/>
+                    <field name="log_html" nolabel="1"/>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="upgrade_agent_action" model="ir.actions.act_window">
+        <field name="name">Upgrade panel agent</field>
+        <field name="res_model">upgrade.agent.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">current</field>
+    </record>
+
+    <menuitem id="upgrade_agent_menu" name="Upgrade panel agent" parent="base.menu_administration"
+              action="upgrade_agent_action" groups="base.group_system" sequence="90"/>
+</odoo>

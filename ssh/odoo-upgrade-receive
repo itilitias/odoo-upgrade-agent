@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Tar imot en oppgradert Odoo-backup fra oppgraderingspanelet over SSH.
+
+Skriptet kjøres som tvunget kommando i ~/.ssh/authorized_keys, slik at panelets nøkkel
+bare kan gjøre det skriptet tillater:
+
+    command="/usr/local/bin/odoo-upgrade-receive",restrict,from="203.0.113.10" ssh-ed25519 AAAA… odoo-upgrade-panel
+
+Kommandoer (sendes av panelet):
+    hello                               versjon og konfigurasjon
+    check <db>                          finnes databasen, ledig plass
+    restore <db> [--overwrite] [--neutralize]
+                                        les backup.zip fra stdin og gjenopprett
+
+Innstillinger i /etc/odoo-upgrade-receive.conf (valgfri):
+
+    [receive]
+    odoo_conf = /etc/odoo/odoo.conf     # leser db_host, db_port, db_user, db_password, data_dir
+    data_dir =                          # overstyr Odoos data_dir (filestore ligger i <data_dir>/filestore/<db>)
+    allow_overwrite = false             # må være true for at panelet kan erstatte en database
+    db_pattern = ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$
+    after_restore =                     # kommando som kjøres etterpå, f.eks. sudo systemctl restart odoo
+
+Skriptet bruker psql/createdb/dropdb fra serveren og trenger ingen andre pakker.
+"""
+
+import configparser
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+VERSION = "1.0"
+CONF = os.environ.get("ODOO_UPGRADE_RECEIVE_CONF", "/etc/odoo-upgrade-receive.conf")
+
+NEUTRALIZE = [
+    "UPDATE ir_cron SET active = false",
+    "UPDATE ir_mail_server SET active = false",
+    "UPDATE fetchmail_server SET active = false",
+    "UPDATE payment_provider SET state = 'disabled' WHERE state <> 'disabled'",
+    "UPDATE ir_config_parameter SET value = gen_random_uuid()::text WHERE key = 'database.uuid'",
+]
+
+
+def say(msg):
+    print(f"STATUS {msg}", flush=True)
+
+
+def fail(msg, code=1):
+    print(f"ERROR {msg}", flush=True)
+    sys.exit(code)
+
+
+def load_settings():
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF)
+    r = cfg["receive"] if cfg.has_section("receive") else {}
+    odoo = configparser.ConfigParser()
+    odoo_conf = r.get("odoo_conf", "/etc/odoo/odoo.conf")
+    odoo.read(odoo_conf)
+    o = odoo["options"] if odoo.has_section("options") else {}
+
+    def pick(key, odoo_key=None, default=""):
+        value = r.get(key) or o.get(odoo_key or key) or default
+        return "" if value in ("False", "false", None) else str(value)
+
+    data_dir = pick("data_dir", default=os.path.expanduser("~/.local/share/Odoo"))
+    env = os.environ.copy()
+    for env_key, key in (("PGHOST", "db_host"), ("PGPORT", "db_port"), ("PGUSER", "db_user"), ("PGPASSWORD", "db_password")):
+        value = pick(key)
+        if value:
+            env[env_key] = value
+    return {
+        "env": env,
+        "data_dir": data_dir,
+        "odoo_conf": odoo_conf,
+        "allow_overwrite": str(r.get("allow_overwrite", "false")).lower() in ("1", "true", "yes"),
+        "db_pattern": r.get("db_pattern", r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"),
+        "after_restore": r.get("after_restore", ""),
+    }
+
+
+def psql(s, sql, db="postgres", check=True):
+    p = subprocess.run(["psql", "-X", "-q", "-At", "-d", db, "-c", sql], env=s["env"], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        fail(f"psql: {p.stderr.strip()[:300]}")
+    return p.stdout.strip()
+
+
+def db_exists(s, name):
+    return psql(s, f"SELECT 1 FROM pg_database WHERE datname = '{name}'") == "1"
+
+
+def cmd_hello(s, args):
+    print(json.dumps({"receiver": VERSION, "odoo_conf": s["odoo_conf"], "data_dir": s["data_dir"],
+                      "allow_overwrite": s["allow_overwrite"]}), flush=True)
+
+
+def cmd_check(s, args):
+    name = args[0] if args else ""
+    if not re.fullmatch(s["db_pattern"], name):
+        fail("ugyldig databasenavn")
+    os.makedirs(s["data_dir"], exist_ok=True)
+    free = shutil.disk_usage(s["data_dir"]).free
+    print(json.dumps({"exists": db_exists(s, name), "free_gb": round(free / 1e9, 1),
+                      "allow_overwrite": s["allow_overwrite"]}), flush=True)
+
+
+def cmd_restore(s, args):
+    if not args:
+        fail("mangler databasenavn")
+    name, flags = args[0], set(args[1:])
+    if not re.fullmatch(s["db_pattern"], name):
+        fail("ugyldig databasenavn")
+    overwrite, neutralize = "--overwrite" in flags, "--neutralize" in flags
+    if db_exists(s, name):
+        if not overwrite:
+            fail(f"databasen «{name}» finnes allerede")
+        if not s["allow_overwrite"]:
+            fail("serveren tillater ikke å erstatte databaser (allow_overwrite = false i /etc/odoo-upgrade-receive.conf)")
+
+    os.makedirs(s["data_dir"], exist_ok=True)
+    work = tempfile.mkdtemp(prefix=".upgrade-receive-", dir=s["data_dir"])
+    try:
+        say("tar imot backup")
+        path = os.path.join(work, "backup.zip")
+        with open(path, "wb") as out:
+            shutil.copyfileobj(sys.stdin.buffer, out, 4 * 1024 * 1024)
+        say(f"mottatt {os.path.getsize(path) / 1048576:.0f} MB")
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            if "dump.sql" not in names:
+                fail("backupen mangler dump.sql")
+            for n in names:
+                if n.startswith("/") or ".." in n.split("/"):
+                    fail(f"ugyldig sti i backupen: {n}")
+            zf.extract("dump.sql", work)
+            fs_members = [n for n in names if n.startswith("filestore/") and not n.endswith("/")]
+            fs_tmp = os.path.join(work, "fs")
+            for n in fs_members:
+                zf.extract(n, fs_tmp)
+        os.remove(path)
+
+        if db_exists(s, name):
+            say(f"sletter gamle «{name}»")
+            psql(s, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}' AND pid <> pg_backend_pid()")
+            r = subprocess.run(["dropdb", name], env=s["env"], capture_output=True, text=True)
+            if r.returncode != 0:
+                fail(f"dropdb: {r.stderr.strip()[:300]}")
+        say("lager database")
+        r = subprocess.run(["createdb", "-T", "template0", "-E", "UTF8", name], env=s["env"], capture_output=True, text=True)
+        if r.returncode != 0:
+            fail(f"createdb: {r.stderr.strip()[:300]}")
+        say("gjenoppretter database")
+        r = subprocess.run(["psql", "-X", "-q", "-o", "/dev/null", "-d", name, "-f", os.path.join(work, "dump.sql")],
+                           env=s["env"], capture_output=True, text=True)
+        tables = psql(s, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'ir_module_module'", db=name)
+        if tables != "1":
+            fail(f"gjenopprettingen feilet: {r.stderr.strip()[-300:]}")
+
+        say("kopierer filestore")
+        target = os.path.join(s["data_dir"], "filestore", name)
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        src = os.path.join(work, "fs", "filestore")
+        if os.path.isdir(src):
+            shutil.move(src, target)
+        else:
+            os.makedirs(target)
+
+        if neutralize:
+            say("slår av e-post og planlagte handlinger (testkopi)")
+            for stmt in NEUTRALIZE:
+                psql(s, stmt, db=name, check=False)
+
+        if s["after_restore"]:
+            say("kjører after_restore")
+            subprocess.run(shlex.split(s["after_restore"]), env=s["env"])
+        print(f"OK {name}", flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+    original = os.environ.get("SSH_ORIGINAL_COMMAND") or " ".join(sys.argv[1:])
+    parts = shlex.split(original)
+    if not parts:
+        fail("ingen kommando")
+    commands = {"hello": cmd_hello, "check": cmd_check, "restore": cmd_restore}
+    if parts[0] not in commands:
+        fail(f"ukjent kommando: {parts[0]}")
+    commands[parts[0]](load_settings(), parts[1:])
+
+
+if __name__ == "__main__":
+    main()
