@@ -17,7 +17,7 @@ never shared.
   modules, modules stuck in an operation, neutralization and recent errors in the log.
 * Every call is logged.
 """,
-    "version": "1.2.0",
+    "version": "1.3.0",
     "category": "Administration",
     "author": "ITILITI AS",
     "website": "https://itiliti.no",

@@ -176,6 +176,33 @@ finally:
 RECEIVE_CHUNK_MAX = 32 * 1024 * 1024
 
 
+def _lit(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _psql(db, *stmts):
+    env, _dump = _pg_tools()
+    args = [_find_tool("psql"), "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-d", db]
+    for st in stmts:
+        args += ["-c", st]
+    p = subprocess.run(args, env=env, capture_output=True, text=True, timeout=600)
+    if p.returncode != 0:
+        raise RuntimeError("psql: " + p.stderr.strip()[-400:])
+    return p.stdout.strip()
+
+
+def _previous_dbs(dbname):
+    prefix = dbname + "_forrige_"
+    out = _psql("postgres", "SELECT datname || chr(9) || pg_database_size(datname) FROM pg_database "
+                            "WHERE datname LIKE %s ORDER BY datname" % _lit(prefix.replace("_", "\\_") + "%"))
+    res = []
+    for line in out.splitlines():
+        n, _, size = line.partition("\t")
+        if n.startswith(prefix):
+            res.append({"name": n, "size_mb": round(int(size or 0) / 1048576)})
+    return res
+
+
 def recv_dir(dbname):
     return os.path.join(config["data_dir"], "upgrade_panel_agent", "receive-" + dbname)
 
@@ -526,6 +553,35 @@ class UpgradePanelAgentReceive(UpgradePanelAgent):
     @http.route("/upgrade_panel_agent/receive/status", type="http", auth="none", methods=["GET"], csrf=False, save_session=False)
     def receive_status(self, **kw):
         return self._run("receive status", lambda env, dbname, log, ip: _json(_read_status(recv_dir(dbname)) or {"state": "none"}))
+
+    @http.route("/upgrade_panel_agent/receive/previous", type="http", auth="none", methods=["GET"], csrf=False, save_session=False)
+    def receive_previous(self, **kw):
+        """De forrige databasene agenten tok vare på ved erstatning (<db>_forrige_<tid>). Odoo viser dem ikke."""
+        return self._run("previous list", lambda env, dbname, log, ip: _json({"previous": _previous_dbs(dbname)}))
+
+    @http.route("/upgrade_panel_agent/receive/drop_previous", type="http", auth="none", methods=["POST"], csrf=False, save_session=False)
+    def receive_drop_previous(self, name="", **kw):
+        """Slett én forrige database og filestore-mappen dens. Bare når «Allow replace» er på, og bare <db>_forrige_*."""
+        def handler(env, dbname, log, ip):
+            denied = self._guard(env)
+            if denied:
+                log.add(ip, "drop previous", False, "replace not allowed")
+                return denied
+            known = {p["name"]: p for p in _previous_dbs(dbname)}
+            if name not in known:
+                return _json({"error": "Unknown previous database."}, 404)
+            _psql("postgres",
+                  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()" % _lit(name),
+                  'DROP DATABASE IF EXISTS "%s"' % name.replace('"', '""'))
+            try:
+                fs = config.filestore(name)
+            except Exception:
+                fs = os.path.join(config["data_dir"], "filestore", name)
+            shutil.rmtree(fs, ignore_errors=True)
+            log.add(ip, "drop previous", True, name)
+            return _json({"dropped": name, "size_mb": known[name]["size_mb"]})
+
+        return self._run("drop previous", handler)
 
 
 def health_report(env):
