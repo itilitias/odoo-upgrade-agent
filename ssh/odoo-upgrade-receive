@@ -7,10 +7,12 @@ bare kan gjøre det skriptet tillater:
     command="/usr/local/bin/odoo-upgrade-receive",restrict,from="203.0.113.10" ssh-ed25519 AAAA… odoo-upgrade-panel
 
 Kommandoer (sendes av panelet):
-    hello                               versjon og konfigurasjon
+    hello                               versjon, Odoo-versjon og konfigurasjon
     check <db>                          finnes databasen, ledig plass
     restore <db> [--overwrite] [--neutralize]
                                         les backup.zip fra stdin og gjenopprett
+    addons <mappe>                      les en zip med moduler fra stdin og legg dem i addons_dir/<mappe>
+                                        (bare hvis addons_dir er satt)
 
 Innstillinger i /etc/odoo-upgrade-receive.conf (valgfri):
 
@@ -20,6 +22,9 @@ Innstillinger i /etc/odoo-upgrade-receive.conf (valgfri):
     allow_overwrite = false             # må være true for at panelet kan erstatte en database
     db_pattern = ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$
     after_restore =                     # kommando som kjøres etterpå, f.eks. sudo systemctl restart odoo
+    odoo_bin =                          # odoo/odoo-bin for å lese Odoo-versjonen (finnes ellers i PATH)
+    addons_dir =                        # mappe i addons_path der panelet kan legge egne moduler (tom = av)
+    after_addons =                      # kommando etter nye moduler, f.eks. sudo systemctl restart odoo
 
 Skriptet bruker psql/createdb/dropdb fra serveren og trenger ingen andre pakker.
 """
@@ -35,7 +40,7 @@ import sys
 import tempfile
 import zipfile
 
-VERSION = "1.0"
+VERSION = "1.1"
 CONF = os.environ.get("ODOO_UPGRADE_RECEIVE_CONF", "/etc/odoo-upgrade-receive.conf")
 
 NEUTRALIZE = [
@@ -82,6 +87,9 @@ def load_settings():
         "allow_overwrite": str(r.get("allow_overwrite", "false")).lower() in ("1", "true", "yes"),
         "db_pattern": r.get("db_pattern", r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"),
         "after_restore": r.get("after_restore", ""),
+        "odoo_bin": r.get("odoo_bin", ""),
+        "addons_dir": r.get("addons_dir", ""),
+        "after_addons": r.get("after_addons", ""),
     }
 
 
@@ -96,9 +104,62 @@ def db_exists(s, name):
     return psql(s, f"SELECT 1 FROM pg_database WHERE datname = '{name}'") == "1"
 
 
+def odoo_version(s):
+    """Hovedversjonen til Odoo på serveren (f.eks. 19), eller None."""
+    candidates = [s["odoo_bin"]] if s["odoo_bin"] else [shutil.which(n) for n in ("odoo", "odoo-bin")]
+    for exe in [c for c in candidates if c]:
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = re.search(r"(?:saas~)?(\d+)\.\d", p.stdout + p.stderr)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def cmd_hello(s, args):
     print(json.dumps({"receiver": VERSION, "odoo_conf": s["odoo_conf"], "data_dir": s["data_dir"],
-                      "allow_overwrite": s["allow_overwrite"]}), flush=True)
+                      "allow_overwrite": s["allow_overwrite"], "odoo_version": odoo_version(s),
+                      "addons": bool(s["addons_dir"])}), flush=True)
+
+
+def cmd_addons(s, args):
+    """Legg egne moduler i addons_dir/<mappe>. Mappen byttes ut i sin helhet; ingenting utenfor den røres."""
+    if not s["addons_dir"]:
+        fail("addons_dir er ikke satt i /etc/odoo-upgrade-receive.conf, så panelet kan ikke legge inn moduler over SSH")
+    folder = args[0] if args else ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", folder):
+        fail("ugyldig mappenavn")
+    base = os.path.realpath(s["addons_dir"])
+    os.makedirs(base, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=".upgrade-addons-", dir=base)
+    try:
+        say("tar imot moduler")
+        path = os.path.join(work, "addons.zip")
+        with open(path, "wb") as out:
+            shutil.copyfileobj(sys.stdin.buffer, out, 4 * 1024 * 1024)
+        new = os.path.join(work, "new")
+        with zipfile.ZipFile(path) as zf:
+            for n in zf.namelist():
+                if n.startswith("/") or ".." in n.split("/"):
+                    fail(f"ugyldig sti: {n}")
+            zf.extractall(new)
+        mods = sorted(d for d in os.listdir(new) if os.path.isfile(os.path.join(new, d, "__manifest__.py")))
+        if not mods:
+            fail("fant ingen moduler i zip-filen")
+        target = os.path.join(base, folder)
+        old = os.path.join(work, "old")
+        if os.path.exists(target):
+            os.rename(target, old)
+        os.rename(new, target)
+        say(f"la inn {len(mods)} moduler i {target}")
+        if s["after_addons"]:
+            say("kjører after_addons")
+            subprocess.run(shlex.split(s["after_addons"]), env=s["env"])
+        print(f"OK {target} {','.join(mods)}", flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def cmd_check(s, args):
@@ -192,7 +253,7 @@ def main():
     parts = shlex.split(original)
     if not parts:
         fail("ingen kommando")
-    commands = {"hello": cmd_hello, "check": cmd_check, "restore": cmd_restore}
+    commands = {"hello": cmd_hello, "check": cmd_check, "restore": cmd_restore, "addons": cmd_addons}
     if parts[0] not in commands:
         fail(f"ukjent kommando: {parts[0]}")
     commands[parts[0]](load_settings(), parts[1:])

@@ -24,6 +24,10 @@ def hash_token(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def receive_allowed(env):
+    return get_param(env, "receive") == "1"
+
+
 def open_until(env):
     value = get_param(env, "open_until")
     if not value:
@@ -66,6 +70,10 @@ class UpgradeAgentWizard(models.TransientModel):
         help="Comma separated IP addresses or networks (e.g. 203.0.113.10, 10.0.0.0/8). Empty: any address.",
     )
     new_token = fields.Char(string="New key", readonly=True)
+    receive_ack = fields.Boolean(
+        string="This database is a staging/test copy",
+        help="Tick to confirm that this database is NOT production before allowing the panel to replace it.",
+    )
     status_html = fields.Html(compute="_compute_status", sanitize=False)
     log_html = fields.Html(compute="_compute_status", sanitize=False)
 
@@ -84,6 +92,8 @@ class UpgradeAgentWizard(models.TransientModel):
                 ("Status", f"<b style='color:#1e7f52'>Open until {until:%Y-%m-%d %H:%M} UTC</b>" if until
                  else "<b style='color:#b8322b'>Closed</b>"),
                 ("Key", "Set" if has_key else "Not created yet"),
+                ("Replace from panel", "<b style='color:#b8322b'>Allowed: the panel may replace this database</b>"
+                 if receive_allowed(self.env) else "Not allowed (read only)"),
                 ("Agent address", f"<code>{html.escape(base)}</code>"),
                 ("Database", f"<code>{html.escape(self.env.cr.dbname)}</code>"),
             ]
@@ -132,4 +142,18 @@ class UpgradeAgentWizard(models.TransientModel):
         set_param(self.env, "token_hash", "")
         set_param(self.env, "open_until", "")
         self.env["upgrade.agent.log"].add("-", "key revoked", True, f"by {self.env.user.login}")
+        return self._reopen()
+
+    def action_allow_receive(self):
+        if not self.receive_ack:
+            from odoo.exceptions import UserError
+
+            raise UserError("Tick «This database is a staging/test copy» first. Never allow this in production.")
+        set_param(self.env, "receive", "1")
+        self.env["upgrade.agent.log"].add("-", "replace allowed", True, f"by {self.env.user.login}")
+        return self._reopen()
+
+    def action_block_receive(self):
+        set_param(self.env, "receive", "")
+        self.env["upgrade.agent.log"].add("-", "replace blocked", True, f"by {self.env.user.login}")
         return self._reopen()

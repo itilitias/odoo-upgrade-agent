@@ -4,7 +4,7 @@ Two small tools that let the Odoo upgrade panel work with any hosting provider w
 
 ## `upgrade_panel_agent/` – Odoo module (fetch backups)
 
-Install it like any other custom module (CloudPepper: *Details → Addons → add this repository*; Skysize/Odoo.sh: add to your deploy repository; own server: copy into `addons_path`). Depends only on `base`; written for Odoo 16–19, tested on 19.
+Install it like any other custom module (CloudPepper: *Details → Addons → add this repository*; Skysize/Odoo.sh: add to your deploy repository; own server: copy into `addons_path`). Depends only on `base`; written for Odoo 16–20, tested on 19.
 
 In Odoo: *Settings → Upgrade panel agent*
 
@@ -12,7 +12,18 @@ In Odoo: *Settings → Upgrade panel agent*
 2. Optionally restrict to the panel's IP, then **Open access** (default 4 hours, max 72).
 3. Paste the address and key into the panel ("New job → Via agent").
 
-The agent can only read a backup of its own database. It cannot drop, restore, create or rename databases. Every call is logged; access closes automatically after 10 wrong keys.
+By default the agent can only read a backup of its own database. Every call is logged; access closes automatically after 10 wrong keys.
+
+### Replace a staging database (1.1)
+
+In a **staging/test** database you can let the panel replace the database with an upgraded copy: tick *This database is a staging/test copy* and press **Allow replace** (off by default, per database). The panel then uploads the copy in small chunks (no proxy upload limits), and the agent
+
+1. checks size and SHA-256,
+2. restores it as a new database next to the current one, with filestore,
+3. neutralizes it (crons, mail servers, payment providers off, new `database.uuid`) and copies the agent settings over,
+4. swaps the names: the current database is kept as `<db>_forrige_<timestamp>`, the copy takes its name.
+
+If anything fails before the swap, nothing is replaced. The copy must have `upgrade_panel_agent` installed (the panel does this). Never allow replace in production.
 
 ## `ssh/odoo-upgrade-receive` – receiver script (upload results)
 

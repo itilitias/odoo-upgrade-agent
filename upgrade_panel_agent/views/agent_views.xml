@@ -8,7 +8,7 @@
                 <sheet>
                     <div class="oe_title">
                         <h1>Upgrade panel agent</h1>
-                        <p>Lets the upgrade panel fetch a backup of this database without enabling the database manager (list_db) or sharing the master password. Access is off until you open it.</p>
+                        <p>Lets the upgrade panel fetch a backup of this database without enabling the database manager (list_db) or sharing the master password. In a staging/test database you can also let the panel replace it with an upgraded copy. Access is off until you open it.</p>
                     </div>
                     <field name="status_html" nolabel="1"/>
                     <group string="1. Key">
@@ -26,6 +26,14 @@
                     <div>
                         <button name="action_open" type="object" string="Open access" class="btn-primary"/>
                         <button name="action_close" type="object" string="Close now" class="btn-secondary"/>
+                    </div>
+                    <group string="3. Replace from the panel (staging/test only)">
+                        <field name="receive_ack"/>
+                        <div colspan="2" class="text-muted">Lets the upgrade panel replace THIS database with an upgraded copy (new database ID, neutralized). The current database is kept under a new name as a backup. Requires open access and the key. Never allow this in production.</div>
+                    </group>
+                    <div>
+                        <button name="action_allow_receive" type="object" string="Allow replace" class="btn-secondary" confirm="Allow the panel to replace this database? Only do this in a staging or test database."/>
+                        <button name="action_block_receive" type="object" string="Block replace" class="btn-link"/>
                     </div>
                     <separator string="Log"/>
                     <field name="log_html" nolabel="1"/>

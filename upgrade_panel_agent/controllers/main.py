@@ -7,6 +7,11 @@ Alle kall krever:
 
 Backupen lages av en frakoblet prosess (pg_dump + zip), slik at den ikke stoppes av
 ``limit_time_real``. Panelet henter filen i biter.
+
+Erstatte (bare staging/test, av som standard): når en administrator har slått på «Allow replace»
+i denne databasen, kan panelet sende en oppgradert kopi i små biter (ingen grense i proxyen foran
+Odoo). En frakoblet prosess gjenoppretter den som ny database, nøytraliserer den, tar med agentens
+innstillinger, og bytter navn: den gamle databasen beholdes som <db>_forrige_<tid>.
 """
 
 import hmac
@@ -24,7 +29,9 @@ from odoo import SUPERUSER_ID, api, http, release
 from odoo.http import request
 from odoo.tools import config
 
-from ..models.agent import get_param, hash_token, open_until, set_param
+import hashlib
+
+from ..models.agent import get_param, hash_token, open_until, receive_allowed, set_param
 
 _logger = logging.getLogger(__name__)
 MAX_FAILS = 10
@@ -63,6 +70,122 @@ try:
 except Exception as exc:
     write(state="failed", error=str(exc))
 """
+
+
+RECEIVE_SCRIPT = r"""
+import json, os, shutil, subprocess, sys, time, zipfile
+work, dbname, data_dir, psql = sys.argv[1:5]
+status = os.path.join(work, "status.json")
+def write(**kw):
+    tmp = status + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(kw, f)
+    os.replace(tmp, status)
+def q(name):
+    return '"' + name.replace('"', '""') + '"'
+def lit(value):
+    return "'" + str(value).replace("'", "''") + "'"
+def sql(db, *stmts, check=True):
+    args = [psql, "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-d", db]
+    for st in stmts:
+        args += ["-c", st]
+    p = subprocess.run(args, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError("psql: " + p.stderr.strip()[-400:])
+    return p.stdout.strip()
+stamp = time.strftime("%Y%m%d%H%M%S")
+new = (dbname + "_upn_" + stamp)[:63]
+bak = (dbname + "_forrige_" + stamp)[:63]
+fs = os.path.join(data_dir, "filestore")
+swapped = False
+NEUTRALIZE = [
+    "UPDATE ir_cron SET active = false",
+    "UPDATE ir_mail_server SET active = false",
+    "UPDATE fetchmail_server SET active = false",
+    "UPDATE payment_provider SET state = 'disabled' WHERE state <> 'disabled'",
+    "UPDATE ir_config_parameter SET value = gen_random_uuid()::text WHERE key = 'database.uuid'",
+]
+try:
+    write(state="running", step="unpack")
+    path = os.path.join(work, "incoming.zip")
+    target_fs = os.path.join(fs, new)
+    with zipfile.ZipFile(path) as zf:
+        for n in zf.namelist():
+            if n.startswith("/") or ".." in n.split("/"):
+                raise RuntimeError("invalid path in backup: " + n)
+        zf.extract("dump.sql", work)
+        for info in zf.infolist():
+            if info.filename.startswith("filestore/") and not info.is_dir():
+                dest = os.path.join(target_fs, info.filename[len("filestore/"):])
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(info) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out, 1024 * 1024)
+    os.makedirs(target_fs, exist_ok=True)
+    os.remove(path)
+    write(state="running", step="restore")
+    sql("postgres", "CREATE DATABASE %s TEMPLATE template0 ENCODING 'UTF8'" % q(new))
+    p = subprocess.run([psql, "-X", "-q", "-o", os.devnull, "-d", new, "-f", os.path.join(work, "dump.sql")],
+                       capture_output=True, text=True)
+    os.remove(os.path.join(work, "dump.sql"))
+    if sql(new, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'ir_module_module'") != "1":
+        raise RuntimeError("restore failed: " + p.stderr.strip()[-400:])
+    if sql(new, "SELECT state FROM ir_module_module WHERE name = 'upgrade_panel_agent'") != "installed":
+        raise RuntimeError("the copy does not have upgrade_panel_agent installed; nothing was replaced")
+    write(state="running", step="neutralize")
+    for st in NEUTRALIZE:
+        sql(new, st, check=False)
+    # Agentens innstillinger (nøkkel, tilgang, IP-liste, erstatte) følger med, så panelet kan fortsette
+    rows = sql(dbname, "SELECT key || chr(9) || coalesce(value, '') FROM ir_config_parameter WHERE key LIKE 'upgrade\\_panel\\_agent.%'")
+    stmts = ["DELETE FROM ir_config_parameter WHERE key LIKE 'upgrade\\_panel\\_agent.%'"]
+    for line in rows.splitlines():
+        key, _, value = line.partition("\t")
+        stmts.append("INSERT INTO ir_config_parameter (key, value) VALUES (%s, %s)" % (lit(key), lit(value)))
+    sql(new, *stmts)
+    write(state="running", step="swap")
+    sql("postgres",
+        "ALTER DATABASE %s ALLOW_CONNECTIONS false" % q(dbname),
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN (%s, %s) AND pid <> pg_backend_pid()" % (lit(dbname), lit(new)),
+        "ALTER DATABASE %s RENAME TO %s" % (q(dbname), q(bak)))
+    try:
+        sql("postgres", "ALTER DATABASE %s RENAME TO %s" % (q(new), q(dbname)))
+    except Exception:
+        sql("postgres", "ALTER DATABASE %s RENAME TO %s" % (q(bak), q(dbname)),
+            "ALTER DATABASE %s ALLOW_CONNECTIONS true" % q(dbname), check=False)
+        raise
+    swapped = True
+    sql("postgres", "ALTER DATABASE %s ALLOW_CONNECTIONS true" % q(bak), check=False)
+    if os.path.isdir(os.path.join(fs, dbname)):
+        os.rename(os.path.join(fs, dbname), os.path.join(fs, bak))
+    os.rename(target_fs, os.path.join(fs, dbname))
+    # Be Odoo-prosessene laste databasen på nytt
+    sql(dbname, "SELECT nextval(c.oid::regclass) FROM pg_class c WHERE c.relkind = 'S' AND c.relname LIKE 'base\\_%signaling%'", check=False)
+    write(state="done", backup=bak)
+except Exception as exc:
+    if not swapped:
+        sql("postgres", "DROP DATABASE IF EXISTS %s" % q(new), check=False)
+        shutil.rmtree(os.path.join(fs, new), ignore_errors=True)
+    write(state="failed", error=str(exc)[-600:], swapped=swapped)
+finally:
+    for n in ("incoming.zip", "dump.sql"):
+        try:
+            os.remove(os.path.join(work, n))
+        except OSError:
+            pass
+"""
+RECEIVE_CHUNK_MAX = 32 * 1024 * 1024
+
+
+def recv_dir(dbname):
+    return os.path.join(config["data_dir"], "upgrade_panel_agent", "receive-" + dbname)
+
+
+def _find_tool(name):
+    try:
+        from odoo.tools.misc import find_pg_tool
+
+        return find_pg_tool(name)
+    except Exception:
+        return shutil.which(name) or name
 
 
 def _pg_tools():
@@ -268,6 +391,113 @@ class UpgradePanelAgent(http.Controller):
             return _json({"state": "deleted"})
 
         return self._run("delete", handler)
+
+
+class UpgradePanelAgentReceive(UpgradePanelAgent):
+    """Ta imot en oppgradert kopi og erstatt denne databasen. Bare når «Allow replace» er slått på."""
+
+    def _guard(self, env):
+        if not receive_allowed(env):
+            return _json({"error": "Replace is not allowed in this database. Allow it in Settings > Upgrade panel agent "
+                                   "(staging/test only)."}, 403)
+        return None
+
+    @http.route("/upgrade_panel_agent/receive/start", type="http", auth="none", methods=["POST"], csrf=False, save_session=False)
+    def receive_start(self, size=0, sha256="", **kw):
+        def handler(env, dbname, log, ip):
+            denied = self._guard(env)
+            if denied:
+                log.add(ip, "receive start", False, "replace not allowed")
+                return denied
+            rdir = recv_dir(dbname)
+            st = _read_status(rdir)
+            if st.get("state") == "running":
+                return _json({"error": "A replace is already running."}, 409)
+            total = int(size or 0)
+            free = shutil.disk_usage(config["data_dir"]).free
+            if total <= 0 or not sha256:
+                return _json({"error": "size and sha256 are required."}, 400)
+            if free < total * 4:
+                return _json({"error": f"Not enough disk space: {free // 1048576} MB free, need about {total * 4 // 1048576} MB."}, 507)
+            shutil.rmtree(rdir, ignore_errors=True)
+            os.makedirs(rdir)
+            with open(os.path.join(rdir, "meta.json"), "w") as f:
+                json.dump({"size": total, "sha256": sha256.lower()}, f)
+            open(os.path.join(rdir, "incoming.zip"), "wb").close()
+            with open(os.path.join(rdir, "status.json"), "w") as f:
+                json.dump({"state": "receiving", "received": 0, "size": total}, f)
+            log.add(ip, "receive start", True, f"{total} bytes")
+            return _json({"state": "receiving", "chunk_max": RECEIVE_CHUNK_MAX})
+
+        return self._run("receive start", handler)
+
+    @http.route("/upgrade_panel_agent/receive/chunk", type="http", auth="none", methods=["POST"], csrf=False, save_session=False)
+    def receive_chunk(self, offset=0, **kw):
+        def handler(env, dbname, log, ip):
+            denied = self._guard(env)
+            if denied:
+                return denied
+            path = os.path.join(recv_dir(dbname), "incoming.zip")
+            if not os.path.isfile(path):
+                return _json({"error": "No upload in progress. Start again."}, 409)
+            have = os.path.getsize(path)
+            if int(offset) != have:
+                return _json({"error": "Wrong offset.", "received": have}, 409)
+            data = request.httprequest.get_data(cache=False)
+            if len(data) > RECEIVE_CHUNK_MAX:
+                return _json({"error": "Chunk too large.", "received": have}, 413)
+            with open(path, "ab") as f:
+                f.write(data)
+            return _json({"received": have + len(data)})
+
+        return self._run("receive chunk", handler)
+
+    @http.route("/upgrade_panel_agent/receive/finish", type="http", auth="none", methods=["POST"], csrf=False, save_session=False)
+    def receive_finish(self, **kw):
+        def handler(env, dbname, log, ip):
+            denied = self._guard(env)
+            if denied:
+                return denied
+            rdir = recv_dir(dbname)
+            path = os.path.join(rdir, "incoming.zip")
+            try:
+                with open(os.path.join(rdir, "meta.json")) as f:
+                    meta = json.load(f)
+            except (OSError, ValueError):
+                return _json({"error": "No upload in progress. Start again."}, 409)
+            if not os.path.isfile(path) or os.path.getsize(path) != meta["size"]:
+                return _json({"error": "The upload is incomplete."}, 409)
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            if h.hexdigest() != meta["sha256"]:
+                os.remove(path)
+                return _json({"error": "Checksum mismatch. The upload was discarded."}, 422)
+            import zipfile
+
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    if "dump.sql" not in zf.namelist():
+                        return _json({"error": "The backup has no dump.sql."}, 422)
+            except zipfile.BadZipFile:
+                return _json({"error": "The upload is not a zip file."}, 422)
+            with open(os.path.join(rdir, "status.json"), "w") as f:
+                json.dump({"state": "running", "step": "starting"}, f)
+            pg_env, _pg_dump = _pg_tools()
+            subprocess.Popen(
+                [sys.executable, "-c", RECEIVE_SCRIPT, rdir, dbname, config["data_dir"], _find_tool("psql")],
+                env=pg_env, start_new_session=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+            )
+            log.add(ip, "replace started", True, f"{meta['size']} bytes")
+            return _json({"state": "running", "step": "starting"})
+
+        return self._run("receive finish", handler)
+
+    @http.route("/upgrade_panel_agent/receive/status", type="http", auth="none", methods=["GET"], csrf=False, save_session=False)
+    def receive_status(self, **kw):
+        return self._run("receive status", lambda env, dbname, log, ip: _json(_read_status(recv_dir(dbname)) or {"state": "none"}))
 
 
 def _read_status(work):
