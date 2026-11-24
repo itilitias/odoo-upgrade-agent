@@ -528,6 +528,93 @@ class UpgradePanelAgentReceive(UpgradePanelAgent):
         return self._run("receive status", lambda env, dbname, log, ip: _json(_read_status(recv_dir(dbname)) or {"state": "none"}))
 
 
+def health_report(env):
+    """Hva som er i orden i denne databasen, sett fra serveren: kode for installerte moduler, versjoner,
+    moduler som har stoppet midt i noe, nøytralisering og feil i loggen. Bare lesing."""
+    from odoo.modules import module as M
+
+    available = {}
+    for name in M.get_modules():
+        try:
+            man = M.get_manifest(name) or {}
+        except Exception:
+            man = {}
+        if man:
+            try:
+                version = M.adapt_version(man.get("version") or "1.0")
+            except Exception:
+                version = man.get("version") or ""
+            available[name] = {"version": version, "installable": man.get("installable", True)}
+    cr = env.cr
+    cr.execute("SELECT name, state, latest_version FROM ir_module_module WHERE state IN "
+               "('installed', 'to upgrade', 'to install', 'to remove')")
+    installed = cr.fetchall()
+    missing, not_installable, outdated, stuck = [], [], [], []
+    for name, state, db_version in installed:
+        code = available.get(name)
+        if state != "installed":
+            stuck.append({"module": name, "state": state})
+        if not code:
+            if state != "to install":
+                missing.append(name)
+        elif not code["installable"]:
+            not_installable.append(name)
+        elif db_version and code["version"] and db_version != code["version"]:
+            outdated.append({"module": name, "db": db_version, "code": code["version"]})
+
+    def count(sql):
+        try:
+            cr.execute("SAVEPOINT upa_health")
+            cr.execute(sql)
+            n = cr.fetchone()[0]
+            cr.execute("RELEASE SAVEPOINT upa_health")
+            return n
+        except Exception:
+            cr.execute("ROLLBACK TO SAVEPOINT upa_health")
+            return None
+
+    errors = []
+    logfile = config.get("logfile")
+    if logfile and os.path.isfile(logfile):
+        try:
+            with open(logfile, "rb") as f:
+                f.seek(max(0, os.path.getsize(logfile) - 2_000_000))
+                lines = f.read().decode("utf-8", errors="replace").splitlines()
+            cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3600))
+            for line in lines:
+                if (" ERROR " in line or " CRITICAL " in line) and line[:19] >= cutoff and f" {cr.dbname} " in line:
+                    errors.append(line[:400])
+        except OSError:
+            pass
+    return {
+        "db": cr.dbname,
+        "version": release.version,
+        "available": sorted(available),
+        "installed": len(installed),
+        "missing": sorted(missing),
+        "not_installable": sorted(not_installable),
+        "outdated": outdated,
+        "stuck": stuck,
+        "active_crons": count("SELECT count(*) FROM ir_cron WHERE active"),
+        "active_mail_servers": count("SELECT count(*) FROM ir_mail_server WHERE active"),
+        "neutralized": bool(count("SELECT count(*) FROM ir_config_parameter WHERE key = 'database.is_neutralized' AND value ILIKE 'true'")),
+        "log_errors": errors[-30:],
+        "logfile": bool(logfile),
+    }
+
+
+class UpgradePanelAgentHealth(UpgradePanelAgentReceive):
+
+    @http.route("/upgrade_panel_agent/health", type="http", auth="none", methods=["GET"], csrf=False, save_session=False)
+    def health(self, **kw):
+        def handler(env, dbname, log, ip):
+            res = health_report(env)
+            log.add(ip, "health", True, f"{len(res['missing'])} missing, {len(res['outdated'])} outdated")
+            return _json(res)
+
+        return self._run("health", handler)
+
+
 def _read_status(work):
     try:
         with open(os.path.join(work, "status.json")) as f:

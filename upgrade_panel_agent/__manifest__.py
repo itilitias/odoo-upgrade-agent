@@ -13,9 +13,11 @@ never shared.
 * Optional, per database and off by default: let the panel replace a staging/test database
   with an upgraded copy. Uploaded in small chunks (no proxy size limits), restored as a new
   database (new database ID, neutralized), then swapped in. The old database is kept as a backup.
+* Health check (read only): installed modules without code on the server, outdated
+  modules, modules stuck in an operation, neutralization and recent errors in the log.
 * Every call is logged.
 """,
-    "version": "1.1.1",
+    "version": "1.2.0",
     "category": "Administration",
     "author": "ITILITI AS",
     "website": "https://itiliti.no",

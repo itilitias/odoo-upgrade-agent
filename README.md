@@ -4,7 +4,7 @@ Two small tools that let the Odoo upgrade panel work with any hosting provider w
 
 ## `upgrade_panel_agent/` – Odoo module (fetch backups)
 
-Install it like any other custom module (CloudPepper: *Details → Addons → add this repository*; Skysize/Odoo.sh: add to your deploy repository; own server: copy into `addons_path`). Depends only on `base`; written for Odoo 16–20, tested on 19.
+Install it like any other custom module (CloudPepper: *Details → Addons → add this repository*; Skysize/Odoo.sh: add to your deploy repository; own server: copy into `addons_path`). Depends only on `base`; tested on Odoo 17, 18, 19 and 20.
 
 In Odoo: *Settings → Upgrade panel agent*
 
@@ -13,6 +13,10 @@ In Odoo: *Settings → Upgrade panel agent*
 3. Paste the address and key into the panel ("New job → Via agent").
 
 By default the agent can only read a backup of its own database. Every call is logged; access closes automatically after 10 wrong keys.
+
+### Health check (1.2)
+
+Read only: installed modules without code on the server, modules whose code version differs from the database, modules stuck in an operation, neutralization (active crons and mail servers) and errors in the log file from the last hour.
 
 ### Replace a staging database (1.1)
 
