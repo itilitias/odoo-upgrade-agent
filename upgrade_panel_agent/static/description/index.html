@@ -1,0 +1,89 @@
+<section class="oe_container">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <img class="img img-fluid" src="banner.png" alt="Upgrade Panel Agent fra ITILITI"/>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h2 class="oe_slogan">Oppgrader Odoo uten å åpne database manager</h2>
+            <p class="oe_mt32">
+                Agenten er en liten modul som kobler kundens Odoo til oppgraderingspanelet fra ITILITI.
+                Panelet kan hente en backup av databasen og, i en staging- eller testdatabase, legge inn en oppgradert kopi.
+                <code>list_db</code> kan stå av, og master-passordet deles aldri.
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span4">
+            <h3>Av som standard</h3>
+            <p>Ingenting virker før en administrator lager en nøkkel og åpner tilgang i et tidsvindu (standard 4 timer, høyst 72).</p>
+        </div>
+        <div class="oe_span4">
+            <h3>Nøkkel og IP-liste</h3>
+            <p>Nøkkelen vises én gang og lagres bare som hash. Du kan begrense til panelets IP-adresse. Etter 10 feil nøkler stenges tilgangen.</p>
+        </div>
+        <div class="oe_span4">
+            <h3>Alt logges</h3>
+            <p>Hvert kall vises i loggen på agentsiden: tid, IP-adresse, hva som ble gjort og om det ble godtatt.</p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h2 class="oe_slogan">Slik virker det</h2>
+            <img class="img img-fluid" src="slik-virker-det.png" alt="Hente backup og erstatte staging, steg for steg"/>
+            <p class="oe_mt32">
+                <strong>Hente backup</strong> fungerer i både produksjon og staging, og leser bare. Backupen lages i bakgrunnen
+                og hentes i biter, så store databaser og grenser i proxyen foran Odoo er ikke et problem.
+            </p>
+            <p>
+                <strong>Erstatte staging</strong> må slås på for hver database, og bare i staging eller test.
+                Panelet sender den oppgraderte kopien i små biter. Agenten kontrollerer sjekksummen, gjenoppretter kopien
+                som en ny database, nøytraliserer den (planlagte handlinger, utgående e-post og betalinger slås av, og den får ny database-ID),
+                og bytter den inn. Den gamle databasen beholdes som <code>&lt;database&gt;_forrige_&lt;tid&gt;</code>,
+                så du kan gå tilbake. Feiler noe før byttet, er stagingen uendret.
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h2 class="oe_slogan">Oppsett</h2>
+            <img class="img img-fluid" src="oppsett.png" alt="Agentsiden i Odoo: nøkkel, åpne tilgang og erstatte"/>
+            <ol class="oe_mt32">
+                <li>Installer modulen og åpne <strong>Innstillinger → Upgrade panel agent</strong>.</li>
+                <li>Trykk <strong>Create new key</strong> og kopier nøkkelen til panelet.</li>
+                <li>Fyll eventuelt inn panelets IP-adresse, og trykk <strong>Open access</strong>.</li>
+                <li>Bare i staging eller test: huk av <strong>This database is a staging/test copy</strong> og trykk <strong>Allow replace</strong>.</li>
+                <li>Når du er ferdig: <strong>Block replace</strong> og <strong>Close now</strong>.</li>
+            </ol>
+            <p>Slå aldri på «Allow replace» i produksjon. Oppgraderingspanelet laster heller aldri opp til produksjon.</p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h2 class="oe_slogan">Installasjon</h2>
+            <ul>
+                <li><strong>CloudPepper:</strong> instansen → Addons → <em>Add Git repository</em> med <code>https://github.com/itilitias/odoo-upgrade-agent</code>, grenen <code>main</code>.</li>
+                <li><strong>Skysize og Odoo.sh:</strong> legg mappen <code>upgrade_panel_agent</code> i repoet de deployer fra.</li>
+                <li><strong>Egen server:</strong> kopier mappen inn i en mappe som står i <code>addons_path</code>, og start Odoo på nytt.</li>
+            </ul>
+            <p>Modulen har Python-kode, så den kan ikke installeres med «Importer modul». Den virker på Odoo 17, 18, 19 og 20, Community og Enterprise.</p>
+            <p class="oe_mt32">Laget av <strong>ITILITI AS</strong>.</p>
+        </div>
+    </div>
+</section>

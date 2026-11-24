@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Tilgang for administratorer, både før og etter Odoo 20 (se models/agent.py: ensure_access) -->
+    <function model="upgrade.agent.log" name="_ensure_access"/>
+</odoo>

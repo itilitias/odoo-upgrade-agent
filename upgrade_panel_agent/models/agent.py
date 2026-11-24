@@ -17,7 +17,16 @@ def get_param(env, key, default=""):
 
 
 def set_param(env, key, value):
-    env["ir.config_parameter"].sudo().set_param(PARAM + key, value or "")
+    icp = env["ir.config_parameter"].sudo()
+    if hasattr(icp, "set_param"):
+        icp.set_param(PARAM + key, value or "")
+    else:  # Odoo 20: set_str
+        icp.set_str(PARAM + key, value or "")
+
+
+def system_param(env, key, default=""):
+    icp = env["ir.config_parameter"].sudo()
+    return (icp.get_param(key, default) if hasattr(icp, "get_param") else icp.get_str(key, default)) or default
 
 
 def hash_token(token):
@@ -39,6 +48,28 @@ def open_until(env):
     return until if until > datetime.utcnow() else None
 
 
+# Tilgang for administratorer. Odoo 20 erstattet ir.model.access med ir.access, så tilgangen lages
+# fra koden (data/access.xml kaller _ensure_access ved installasjon og oppgradering) i stedet for en
+# CSV-fil som bare virker på én av dem.
+ACCESS_MODELS = ("upgrade.agent.log", "upgrade.agent.wizard")
+
+
+def ensure_access(env):
+    group = env.ref("base.group_system")
+    for model in ACCESS_MODELS:
+        mid = env["ir.model"]._get_id(model)
+        name = "upgrade_panel_agent: " + model
+        if "ir.access" in env:
+            access = env["ir.access"].sudo().with_context(active_test=False)
+            if not access.search([("name", "=", name)], limit=1):
+                access.create({"name": name, "model_id": mid, "group_id": group.id, "operation": "crud"})
+        else:
+            access = env["ir.model.access"].sudo().with_context(active_test=False)
+            if not access.search([("name", "=", name)], limit=1):
+                access.create({"name": name, "model_id": mid, "group_id": group.id, "perm_read": True,
+                               "perm_write": True, "perm_create": True, "perm_unlink": True})
+
+
 class UpgradeAgentLog(models.Model):
     _name = "upgrade.agent.log"
     _description = "Upgrade panel agent log"
@@ -48,6 +79,10 @@ class UpgradeAgentLog(models.Model):
     action = fields.Char(readonly=True)
     ok = fields.Boolean(readonly=True)
     detail = fields.Char(readonly=True)
+
+    @api.model
+    def _ensure_access(self):
+        ensure_access(self.env)
 
     @api.model
     def add(self, ip, action, ok, detail=""):
@@ -84,7 +119,7 @@ class UpgradeAgentWizard(models.TransientModel):
         return res
 
     def _compute_status(self):
-        base = self.env["ir.config_parameter"].sudo().get_param("web.base.url", "")
+        base = system_param(self.env, "web.base.url")
         for rec in self:
             until = open_until(self.env)
             has_key = bool(get_param(self.env, "token_hash"))

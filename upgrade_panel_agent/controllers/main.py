@@ -159,6 +159,7 @@ try:
     os.rename(target_fs, os.path.join(fs, dbname))
     # Be Odoo-prosessene laste databasen på nytt
     sql(dbname, "SELECT nextval(c.oid::regclass) FROM pg_class c WHERE c.relkind = 'S' AND c.relname LIKE 'base\\_%signaling%'", check=False)
+    sql(dbname, "INSERT INTO orm_signaling_registry DEFAULT VALUES", check=False)  # Odoo 20
     write(state="done", backup=bak)
 except Exception as exc:
     if not swapped:
@@ -211,18 +212,45 @@ def delete_backup_files(dbname):
 
 def _pick_db():
     try:
-        dbs = odoo.service.db.list_dbs(True)
+        dbs = _list_dbs()
     except Exception:
+        _logger.exception("upgrade_panel_agent: could not list databases")
         return None
     host = request.httprequest.environ.get("HTTP_HOST", "")
-    try:
-        dbs = odoo.http.db_filter(dbs, host=host)
-    except TypeError:
-        dbs = odoo.http.db_filter(dbs)
+    db_filter = getattr(odoo.http, "db_filter", None)
+    if db_filter is None:
+        try:
+            from odoo.http.router import db_filter  # Odoo 20
+        except ImportError:
+            db_filter = None
+    if db_filter:
+        try:
+            dbs = db_filter(dbs, host=host)
+        except TypeError:
+            dbs = db_filter(dbs)
     wanted = request.httprequest.args.get("db") or request.httprequest.headers.get("X-Odoo-Database")
     if wanted:
         return wanted if wanted in dbs else None
     return dbs[0] if len(dbs) == 1 else None
+
+
+def _list_dbs():
+    try:
+        from odoo.service.db import list_dbs  # Odoo 16–19
+
+        return list_dbs(True)
+    except ImportError:
+        from odoo.modules.db import list_dbs  # Odoo 20
+
+        return list_dbs(force=True)
+
+
+def _registry(dbname):
+    try:
+        from odoo.modules.registry import Registry
+    except ImportError:  # Odoo 19+: odoo.orm.registry
+        from odoo.orm.registry import Registry
+    return Registry(dbname)
 
 
 def _json(data, status=200):
@@ -257,7 +285,7 @@ class UpgradePanelAgent(http.Controller):
         if not dbname:
             return _json({"error": "Unknown database. Pass ?db=<name>."}, 404)
         try:
-            registry = odoo.modules.registry.Registry(dbname)
+            registry = _registry(dbname)
         except Exception:
             return _json({"error": "Unknown database."}, 404)
         with registry.cursor() as cr:

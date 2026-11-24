@@ -1,6 +1,6 @@
 {
     "name": "Upgrade Panel Agent",
-    "summary": "Lets an upgrade panel fetch a backup of this database, and (staging only) replace it, without the database manager",
+    "summary": "Kobler Odoo til oppgraderingspanelet: hent backup, og (bare i staging) legg inn en oppgradert kopi, uten database manager",
     "description": """
 Gives an Odoo upgrade panel read-only access to a backup of *this* database (SQL dump,
 manifest and filestore), so ``list_db`` can stay ``False`` and the master password is
@@ -15,13 +15,15 @@ never shared.
   database (new database ID, neutralized), then swapped in. The old database is kept as a backup.
 * Every call is logged.
 """,
-    "version": "1.1.0",
+    "version": "1.1.1",
     "category": "Administration",
     "author": "ITILITI AS",
+    "website": "https://itiliti.no",
+    "images": ["static/description/banner.png"],
     "license": "LGPL-3",
     "depends": ["base"],
     "data": [
-        "security/ir.model.access.csv",
+        "data/access.xml",
         "views/agent_views.xml",
     ],
     "installable": True,
